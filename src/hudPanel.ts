@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { HUDData, HUDModuleConfig, WebviewMessage } from './types';
+import { HUDData, HUDModuleConfig, HUDSavedLayout, WebviewMessage } from './types';
 import { ConfigManager } from './configManager';
 import { loadLocale } from './locales';
 
@@ -16,6 +16,7 @@ export class HUDPanelProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly configManager: ConfigManager,
+    private readonly globalState: vscode.Memento,
   ) {}
 
   resolveWebviewView(
@@ -44,6 +45,10 @@ export class HUDPanelProvider implements vscode.WebviewViewProvider {
     const initialIsLight = vscode.window.activeColorTheme.kind === vscode.ColorThemeKind.Light;
     webviewView.webview.postMessage({ type: 'themeChanged', isLight: initialIsLight } satisfies WebviewMessage);
 
+    // Send saved layout so webview can restore module order and display mode
+    const savedLayout = this.globalState.get<HUDSavedLayout>('claudeHud.layout') || {};
+    webviewView.webview.postMessage({ type: 'layout', layout: savedLayout } satisfies WebviewMessage);
+
     // Listen for VS Code color theme changes and propagate to webview
     const themeDisposable = vscode.window.onDidChangeActiveColorTheme((colorTheme) => {
       const isLight = colorTheme.kind === vscode.ColorThemeKind.Light;
@@ -52,13 +57,16 @@ export class HUDPanelProvider implements vscode.WebviewViewProvider {
     webviewView.onDidDispose(() => themeDisposable.dispose());
 
     // listen for messages from the webview
-    webviewView.webview.onDidReceiveMessage((msg: WebviewMessage) => {
+    webviewView.webview.onDidReceiveMessage(async (msg: WebviewMessage) => {
       switch (msg.type) {
         case 'getConfig':
           if (this._latestConfig) this.postConfig(this._latestConfig);
           break;
         case 'toggleModule':
           this.configManager.setModule(msg.module, msg.visible);
+          break;
+        case 'saveLayout':
+          await this.globalState.update('claudeHud.layout', msg.layout);
           break;
       }
     });

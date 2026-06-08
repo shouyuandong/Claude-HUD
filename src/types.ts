@@ -110,10 +110,19 @@ export interface PricingOverride {
   cacheWrite?: number;
 }
 
+/** Persisted layout state (survives VS Code restarts) */
+export interface HUDSavedLayout {
+  moduleOrder?: string[];
+  displayMode?: 'matrix' | 'candle' | 'balls';
+  chartMode?: '24h' | '7d';
+}
+
 export type WebviewMessage =
   | { type: 'update'; data: HUDData }
   | { type: 'config'; modules: HUDModuleConfig }
+  | { type: 'layout'; layout: HUDSavedLayout }
   | { type: 'toggleModule'; module: keyof HUDModuleConfig; visible: boolean }
   | { type: 'switchChart'; mode: '24h' | '7d' }
   | { type: 'getConfig' }
+  | { type: 'saveLayout'; layout: HUDSavedLayout }
   | { type: 'themeChanged'; isLight: boolean };

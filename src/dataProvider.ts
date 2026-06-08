@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { HUDData, AgentStatus, HourlyTokenData, DailyTokenData, CandleData, ConfigCounts, TodoItem, PricingOverride } from './types';
 import { ConfigManager } from './configManager';
+import { HistoryStore } from './historyStore';
 
 /**
  * Real data provider that reads Claude Code session & conversation files
@@ -79,21 +80,16 @@ export class DataProvider {
   private candleLow = 0;
   private candleClose = 0;
   private candleTicks = 0;
-  private candleIndex = 0; // deterministic noise phase
+  private candleIndex = 0;
   private candleHistory: CandleData[] = [];
   private readonly CANDLE_TICK_WINDOW = 20;
   private toolActiveDuringCandle = false;
-  private candleSignalFlag = false; // alternate buy/sell
-  private candleBaseline = 0;
-  private readonly CANDLE_AMPLIFY = 10; // amplify burstRate deviations for visual drama
+  private candleSignalFlag = false;
+  private initialCandlesFilled = false;
 
   // Token rate tracking
   private previousTokenTotal = 0;
   private tokenRateSamples: number[] = [];
-
-  // Hourly / daily history (aggregated from real data)
-  private hourlyHistory: HourlyTokenData[] = [];
-  private dailyHistory: DailyTokenData[] = [];
 
   // Token totals
   private totalInputTokens = 0;
@@ -180,26 +176,27 @@ export class DataProvider {
 
   private readonly claudeDir: string;
   private configManager: ConfigManager;
+  private historyStore: HistoryStore;
 
-  constructor(configManager: ConfigManager) {
+  constructor(configManager: ConfigManager, historyStore: HistoryStore) {
     this.configManager = configManager;
+    this.historyStore = historyStore;
     this.claudeDir = path.join(os.homedir(), '.claude');
     this.discoverSessions();
   }
 
-  init(hourly: HourlyTokenData[], daily: DailyTokenData[]): void {
-    this.hourlyHistory = hourly;
-    this.dailyHistory = daily;
-  }
-
   /**
    * Scan ~/.claude/sessions/ and ~/.claude/projects/ to discover active sessions.
+   * Callable multiple times — already-known sessionIds are skipped.
    */
   private discoverSessions(): void {
     const sessionsDir = path.join(this.claudeDir, 'sessions');
     const projectsDir = path.join(this.claudeDir, 'projects');
 
     if (!fs.existsSync(sessionsDir)) return;
+
+    // Build set of already-discovered session IDs for dedup
+    const knownIds = new Set(this.sessions.map(s => s.sessionId));
 
     try {
       const sessionFiles = fs.readdirSync(sessionsDir);
@@ -212,6 +209,9 @@ export class DataProvider {
           const sessionCwd: string = raw.cwd || '';
           const startedAt: number = raw.startedAt || 0;
           const pid: number = raw.pid || 0;
+
+          // Skip already-discovered sessions
+          if (knownIds.has(sessionId)) continue;
 
           // Check if PID is still alive (session is active)
           let isActive = false;
@@ -229,9 +229,11 @@ export class DataProvider {
           const jsonlPath = path.join(projectDir, `${sessionId}.jsonl`);
 
           if (!fs.existsSync(jsonlPath)) {
-            // Try direct lookup
+            // JSONL not yet written by Claude Code — re-check on next tick
             continue;
           }
+
+          knownIds.add(sessionId);
 
           // Defer full JSONL parsing to first tick — just discover the session path.
           // This saves ~1-3 full file reads on extension activation.
@@ -262,10 +264,10 @@ export class DataProvider {
         }
       }
 
-      // FALLBACK: If no sessions were discovered (all PIDs dead),
+      // FALLBACK: If still no sessions (all PIDs dead or JSONL not yet created),
       // find the most recently modified JSONL for the current project.
       if (this.sessions.length === 0) {
-        this.addFallbackSession(projectsDir);
+        this.addFallbackSession(projectsDir, knownIds);
       }
     } catch {
       // Ignore directory read errors
@@ -278,7 +280,7 @@ export class DataProvider {
    * This handles the case where VS Code reconnects to a Claude process
    * whose PID doesn't match the session file.
    */
-  private addFallbackSession(projectsDir: string): void {
+  private addFallbackSession(projectsDir: string, knownIds: Set<string>): void {
     const currentProjectName = this.cwdToProjectName(this.cwd);
     const projectDir = path.join(projectsDir, currentProjectName);
     if (!fs.existsSync(projectDir)) return;
@@ -299,6 +301,10 @@ export class DataProvider {
 
       const latest = jsonlFiles[0];
       const sessionId = latest.name.replace('.jsonl', '');
+
+      // Skip if this fallback session was already added
+      if (knownIds.has(sessionId)) return;
+      knownIds.add(sessionId);
       const jsonlPath = latest.fullPath;
 
       // Try to find matching session metadata in ~/.claude/sessions/
@@ -789,6 +795,10 @@ export class DataProvider {
    * updating sess.totalInputTokens when we detect file growth.
    */
   private refreshAllSessions(): void {
+    // Re-discover sessions on every tick — handles the race where Claude Code
+    // hasn't written the JSONL file yet when the HUD extension first loads.
+    this.discoverSessions();
+
     let totalInput = 0;
     let totalOutput = 0;
     let totalCacheHit = 0;
@@ -813,8 +823,6 @@ export class DataProvider {
       try {
         const stats = fs.statSync(sess.jsonlPath);
         const newSize = stats.size;
-
-        console.log(`[HUD DEBUG] Processing session ${sess.sessionId.substring(0, 8)}: knownSize=${sess.knownSize} newSize=${newSize}`);
 
         if (newSize > sess.knownSize) {
           // Read only the new bytes since last check
@@ -892,18 +900,13 @@ export class DataProvider {
                     if (toolName === 'TodoWrite' && input) {
                       sess.todoItems.length = 0;
                       const todos = Array.isArray(input.todos) ? input.todos : [];
-                      console.log(`[HUD DEBUG] TodoWrite in incremental: found ${todos.length} items:`, JSON.stringify(todos.map((t: any) => ({c: t.content, s: t.status}))));
                       for (const todo of todos) {
                         const content = typeof todo.content === 'string' ? todo.content : '';
                         const statusRaw = typeof todo.status === 'string' ? todo.status : 'pending';
                         const status = statusRaw === 'completed' ? 'completed' : statusRaw === 'in_progress' ? 'in_progress' : 'pending';
-                        if (!content) {
-                          console.log(`[HUD DEBUG] TodoWrite skipping item with empty content`);
-                          continue;
-                        }
+                        if (!content) continue;
                         sess.todoItems.push({ description: content, status, file: undefined, agentId: 'main' });
                       }
-                      console.log(`[HUD DEBUG] sess.todoItems now has ${sess.todoItems.length} items for session ${sess.sessionId.substring(0, 8)}`);
                     }
                   }
                 }
@@ -965,7 +968,6 @@ export class DataProvider {
 
         // Merge subagent todos into session todoItems (dedup by description)
         const existingDescs = new Set(sess.todoItems.map(t => t.description));
-        console.log(`[HUD DEBUG] Subagent merge: ${subTodos.length} subagent todos, ${sess.todoItems.length} existing items`);
         let mergedCount = 0;
         for (const st of subTodos) {
           if (!existingDescs.has(st.description)) {
@@ -974,7 +976,6 @@ export class DataProvider {
             mergedCount++;
           }
         }
-        if (mergedCount > 0) console.log(`[HUD DEBUG] Merged ${mergedCount} subagent todos, sess.todoItems now ${sess.todoItems.length}`);
 
         // Add subagents to the flat list
         for (const agent of agents) {
@@ -1005,40 +1006,9 @@ export class DataProvider {
     this.totalCacheHitTokens = totalCacheHit;
     this.totalCacheWriteTokens = totalCacheWrite;
 
-    // Update hourly/daily history from real data
+    // Record cumulative token usage to HistoryStore (persisted via VS Code globalState)
     const combinedTokens = totalInput + totalOutput;
-    const now = new Date();
-
-    // Use date+hour key so each hourly slot is uniquely identified (e.g. "06/09 09:00")
-    const monthDay = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}`;
-    const hourKey = `${monthDay} ${String(now.getHours()).padStart(2, '0')}:00`;
-    const dayKey = monthDay;
-
-    // Check if we need to update hourly
-    let updatedHourly = false;
-    for (const h of this.hourlyHistory) {
-      if (h.hour === hourKey) {
-        // Record the delta from last known, cap at combined tokens
-        h.tokens = Math.max(h.tokens, combinedTokens);
-        updatedHourly = true;
-        break;
-      }
-    }
-    if (!updatedHourly && combinedTokens > 0) {
-      this.hourlyHistory.push({ hour: hourKey, tokens: combinedTokens, count: 1 });
-    }
-
-    let updatedDaily = false;
-    for (const d of this.dailyHistory) {
-      if (d.day === dayKey) {
-        d.tokens = Math.max(d.tokens, combinedTokens);
-        updatedDaily = true;
-        break;
-      }
-    }
-    if (!updatedDaily && combinedTokens > 0) {
-      this.dailyHistory.push({ day: dayKey, tokens: combinedTokens, count: 1 });
-    }
+    this.historyStore.recordSample(combinedTokens);
 
     // Update latest task
     if (latestTask !== 'Idle') {
@@ -1051,17 +1021,6 @@ export class DataProvider {
     if (this.sessions.length > 0) {
       this.planMode = this.detectPlanModeFromJsonl(this.sessions[0].jsonlPath);
     }
-
-    // Build last-24-hours series from actual date+hour keys (fill missing with 0)
-    const hourlyMap = new Map(this.hourlyHistory.map(h => [h.hour, h]));
-    const padded: typeof this.hourlyHistory = [];
-    for (let i = 23; i >= 0; i--) {
-      const d = new Date(now);
-      d.setHours(d.getHours() - i, 0, 0, 0);
-      const key = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:00`;
-      padded.push(hourlyMap.get(key) || { hour: key, tokens: 0, count: 0 });
-    }
-    this.hourlyHistory = padded;
   }
 
   /** Return a HUDData snapshot built from real Claude Code data */
@@ -1071,6 +1030,12 @@ export class DataProvider {
 
     // Refresh data from files
     this.refreshAllSessions();
+
+    // Pre-fill 20 initial candles on first tick so the chart isn't empty
+    if (!this.initialCandlesFilled) {
+      this.initialCandlesFilled = true;
+      this.prefillCandles();
+    }
 
     const combinedTokens = this.totalInputTokens + this.totalOutputTokens;
 
@@ -1158,17 +1123,13 @@ export class DataProvider {
     const combinedTodos: TodoItem[] = [];
     const seenTodoDescs = new Set<string>();
     for (const sess of this.sessions) {
-      console.log(`[HUD DEBUG] Session ${sess.sessionId.substring(0, 8)} has ${sess.todoItems.length} todoItems in tickOnce():`, JSON.stringify(sess.todoItems.map((t: {description: string; status: string}) => ({d: t.description, s: t.status}))));
       for (const todo of sess.todoItems) {
         if (!seenTodoDescs.has(todo.description)) {
           seenTodoDescs.add(todo.description);
           combinedTodos.push(todo);
-        } else {
-          console.log(`[HUD DEBUG] Skipped dedup todo: "${todo.description.substring(0, 40)}..."`);
         }
       }
     }
-    console.log(`[HUD DEBUG] combinedTodos has ${combinedTodos.length} items, this.sessions.length = ${this.sessions.length}`);
 
     return {
       tokensUsed: combinedTokens,
@@ -1190,8 +1151,8 @@ export class DataProvider {
       tokenBurstRate: this.burstRate,
       burstHistory: [...this.burstHistory],
       candleHistory: [...this.candleHistory],
-      hourlyHistory: this.hourlyHistory,
-      dailyHistory: this.dailyHistory,
+      hourlyHistory: this.historyStore.getHourlyHistory(),
+      dailyHistory: this.historyStore.getDailyHistory(),
       agents: allAgents.slice(0, 20),
       configCounts: this.scanConfig(),
       todos: combinedTodos,
@@ -1436,32 +1397,82 @@ export class DataProvider {
     return counts;
   }
 
-  // ---- Candlestick tracking — natural OHLC with alternating up/down ----
+  /** Generate 20 initial candles so the chart isn't empty at first render */
+  private prefillCandles(): void {
+    let prevClose = 100;
+    for (let i = 0; i < 20; i++) {
+      // Deterministic pseudo-random numbers from sine hash (same style as trackCandle)
+      const r1 = Math.sin(i * 12.9898 + 0.0) * 43758.5453;
+      const r1f = r1 - Math.floor(r1);
+      const r2 = Math.sin(i * 78.233   + 1.0) * 43758.5453;
+      const r2f = r2 - Math.floor(r2);
+      const r3 = Math.sin(i * 33.970   + 5.3) * 43758.5453;
+      const r3f = r3 - Math.floor(r3);
+      const normal = (r1f + r2f + r3f - 1.5) * 2.2;
+      const meanRev = (100 - prevClose) * 0.02;
+      const pctChange = Math.max(-0.05, Math.min(0.05, meanRev / prevClose + normal * 0.012));
+
+      const open = prevClose;
+      const close = +(prevClose * (1 + pctChange)).toFixed(1);
+      const body = Math.abs(close - open);
+      const wickRatio = 0.15 + r1f * 0.2;
+      const wick = Math.max(0.5, +(body * wickRatio).toFixed(1));
+      const high = +Math.max(open, close).toFixed(1) + wick;
+      const low = +Math.min(open, close).toFixed(1) - wick;
+
+      this.candleHistory.push({
+        open: +open.toFixed(1),
+        high: +high.toFixed(1),
+        low: +low.toFixed(1),
+        close: +close.toFixed(1),
+        label: `--`,
+        signal: undefined,
+      });
+      prevClose = close;
+    }
+    this.candleIndex = 20;
+  }
+
+  // ---- Candlestick tracking — price driven by token consumption rate ----
   private trackCandle(): void {
     if (this.candleTicks === 0) {
-      // Continuity: this candle opens at previous candle's close
+      // Open at previous close, or start at 100
       const prevClose = this.candleHistory.length > 0
         ? this.candleHistory[this.candleHistory.length - 1].close
-        : 50;
+        : 100;
 
-      // Drifting baseline follows burstRate slowly
-      this.candleBaseline += (this.burstRate - this.candleBaseline) * 0.05;
+      // Deterministic pseudo-random numbers (0..1) from sine hash
+      const r1 = Math.sin(this.candleIndex * 12.9898 + 0.0) * 43758.5453;
+      const r1f = r1 - Math.floor(r1);
+      const r2 = Math.sin(this.candleIndex * 78.233   + 1.0) * 43758.5453;
+      const r2f = r2 - Math.floor(r2);
+      const r3 = Math.sin(this.candleIndex * 33.970   + 5.3) * 43758.5453;
+      const r3f = r3 - Math.floor(r3);
 
-      // Synthetic direction oscillator — natural reversal every ~8 candles
-      const dir = Math.sin(this.candleIndex * 0.8) * 18;
+      // Approximate normal distribution (sum of uniforms → roughly -3..+3)
+      const normal = (r1f + r2f + r3f - 1.5) * 2.2;
 
-      // burstRate influence (real signal mixed in)
-      const burstSignal = (this.burstRate - this.candleBaseline) * this.CANDLE_AMPLIFY * 0.2;
+      // burstRate → directional bias: heavy consumption pushes price up,
+      // idle keeps it flat (only noise + mean reversion).
+      // Maps 0..~500 to 0..~0.025 (+2.5% avg move at max).
+      const rateBias = Math.min(0.025, this.burstRate / 20000);
 
-      // Combined movement for this candle
-      const move = Math.round(dir + burstSignal);
+      // Gentle mean reversion toward 100: when burstRate is low and price is
+      // above 100 (from prior high consumption), this pulls price back down.
+      const meanRev = (100 - prevClose) * 0.02;
+
+      // Base volatility ~1.2% per candle, clamped to ±5%
+      const pctChange = Math.max(-0.05, Math.min(0.05,
+        meanRev / prevClose + rateBias + normal * 0.012
+      ));
+
       this.candleOpen = prevClose;
-      this.candleClose = prevClose + move;
+      this.candleClose = +(prevClose * (1 + pctChange)).toFixed(1);
 
-      // Wicks: 30–50% of body size, minimum 3px for visual presence
+      // Wicks: 15-35% of body
       const body = Math.abs(this.candleClose - this.candleOpen);
-      const wickRatio = 0.3 + Math.sin(this.candleIndex * 1.1) * 0.15;
-      const wick = Math.max(3, Math.round(body * wickRatio));
+      const wickRatio = 0.15 + r1f * 0.2;
+      const wick = Math.max(0.5, +(body * wickRatio).toFixed(1));
 
       this.candleHigh = Math.max(this.candleOpen, this.candleClose) + wick;
       this.candleLow = Math.min(this.candleOpen, this.candleClose) - wick;
@@ -1469,9 +1480,10 @@ export class DataProvider {
       this.toolActiveDuringCandle = false;
     }
 
-    // Within-candle micro jitter (tiny, won't flip direction)
-    const jitter = Math.round(Math.sin(this.tickCount * 0.7 + this.candleIndex) * 2);
-    this.candleClose += jitter;
+    // Within-candle micro jitter (tiny — won't flip direction)
+    const jr = Math.sin(this.tickCount * 0.7 + this.candleIndex * 100) * 43758.5453;
+    const jitter = ((jr - Math.floor(jr)) - 0.5) * 0.4;
+    this.candleClose = +(this.candleClose + jitter).toFixed(1);
     this.candleHigh = Math.max(this.candleHigh, this.candleClose);
     this.candleLow = Math.min(this.candleLow, this.candleClose);
     this.candleTicks++;
@@ -1481,17 +1493,12 @@ export class DataProvider {
       if (this.toolActiveDuringCandle) {
         this.candleSignalFlag = !this.candleSignalFlag;
         signal = this.candleSignalFlag ? 'buy' : 'sell';
-        // Boost movement on signal candles
-        if (signal === 'buy') this.candleClose += 14;
-        else this.candleClose -= 14;
-        this.candleHigh = Math.max(this.candleHigh, this.candleClose);
-        this.candleLow = Math.min(this.candleLow, this.candleClose);
       }
       this.candleHistory.push({
-        open: this.candleOpen,
-        high: this.candleHigh,
-        low: this.candleLow,
-        close: this.candleClose,
+        open: +this.candleOpen.toFixed(1),
+        high: +this.candleHigh.toFixed(1),
+        low: +this.candleLow.toFixed(1),
+        close: +this.candleClose.toFixed(1),
         label: `${this.candleTicks * 200}ms`,
         signal,
       });

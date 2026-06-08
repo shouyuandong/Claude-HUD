@@ -2,6 +2,25 @@
 
 All notable changes to the "claude-hud" extension will be documented in this file.
 
+## 0.1.1 - 2026-06-09
+
+### Added
+
+- **Pre-fill 20 K-line candles on open** — Candlestick chart now immediately shows 20 historical candles using deterministic PRNG, instead of appearing one-by-one
+- **OHLC precision** — Open/High/Low/Close values now display with 1 decimal place throughout (data layer and frontend)
+- **Burst Rate candlestick bias** — K-line direction now influenced by token consumption rate: high consumption pushes price up, low consumption keeps it flat, with realistic ±5% clamp
+- **Chinese stock K-line colors** — Auto-detects VS Code locale, red for up and green for down (Chinese convention)
+- **Deterministic PRNG** — Candlestick simulation uses sine-hash math instead of Math.random (reliable across ticks)
+
+### Changed
+
+- **Simplified tracer ball physics** — Replaced complex rate→position math with a simple kick-and-gravity model. Activity kicks the ball upward with fixed velocity so it always reaches the same peak (h*20%). Higher token rate just reduces gravity so the ball floats longer before settling. Uses minimal per-frame state (`_vy`, `_activity`)
+- **Cleaned up stale variable references** — Removed lingering `ratio` and `prevY` references after physics rewrite
+- **Realistic price simulation** — Migrated from absolute math (±64% swings) to percentage-based volatility (~1.2%, clamped ±5%) with mean reversion toward 100
+- **Y-axis scaling** — Switched from wick-inclusive (high/low) to body-only (open/close) range with 15% padding, preventing candle compression from spike wicks
+- **Limit to 20 candles** — K-line chart now only shows last 20 candles via slice(-20)
+- **Cleaned up debug logging** — Removed 9 `[HUD DEBUG]` console.log lines from dataProvider
+
 ## 0.1.0 - 2026-06-09
 
 ### Added

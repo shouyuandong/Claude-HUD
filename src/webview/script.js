@@ -133,6 +133,7 @@ function setTheme(isLight) {
 }
 
 // ---- State ----
+const isChineseLocale = navigator.language.startsWith('zh');
 let currentData = null;
 let modules = {
   agentStatus: true,
@@ -230,6 +231,8 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.classList.add('active');
       chartMode = btn.dataset.mode;
       if (currentData) drawHistoryChart(currentData);
+      // Save chart mode preference
+      vscode.postMessage({ type: 'saveLayout', layout: { moduleOrder: undefined, displayMode, chartMode } });
     });
   });
 
@@ -266,6 +269,8 @@ document.addEventListener('DOMContentLoaded', () => {
           renderMatrixRain(currentData);
         }
       }
+      // Save display mode
+      vscode.postMessage({ type: 'saveLayout', layout: { moduleOrder: undefined, displayMode, chartMode } });
     });
   }
 
@@ -407,7 +412,7 @@ function onDrop(e) {
   }
 
   const newOrder = [...body.querySelectorAll('.hud-module[draggable="true"]')].map(el => el.id);
-  vscode.setState({ ...vscode.getState(), moduleOrder: newOrder });
+  vscode.postMessage({ type: 'saveLayout', layout: { moduleOrder: newOrder, displayMode, chartMode } });
 }
 
 // ---- Message handler ----
@@ -422,6 +427,9 @@ window.addEventListener('message', (event) => {
       modules = { ...modules, ...msg.modules };
       applyConfig();
       break;
+    case 'layout':
+      applySavedLayout(msg.layout);
+      break;
   }
 });
 
@@ -432,6 +440,49 @@ function applyConfig() {
     if (el) el.classList.toggle('hidden', !visible);
     const cb = document.querySelector(`.settings-item input[data-key="${key}"]`);
     if (cb) cb.checked = visible;
+  }
+}
+
+// ---- Apply saved layout (module order, display mode, chart mode) ----
+function applySavedLayout(layout) {
+  if (!layout) return;
+
+  // Restore display mode
+  if (layout.displayMode && ['matrix', 'candle', 'balls'].includes(layout.displayMode)) {
+    displayMode = layout.displayMode;
+    const toggleBtn = $('candleToggle');
+    if (toggleBtn) {
+      toggleBtn.classList.toggle('active', displayMode !== 'matrix');
+      updateToggleIcon(toggleBtn, displayMode);
+    }
+  }
+
+  // Restore chart mode tab
+  if (layout.chartMode && ['24h', '7d'].includes(layout.chartMode)) {
+    chartMode = layout.chartMode;
+    document.querySelectorAll('.chart-tab').forEach(b => {
+      b.classList.toggle('active', b.dataset.mode === chartMode);
+    });
+  }
+
+  // Restore module order
+  if (layout.moduleOrder && layout.moduleOrder.length > 0) {
+    const body = document.getElementById('hudBody');
+    if (!body) return;
+    const existing = [...body.querySelectorAll('.hud-module[draggable="true"]')];
+    const orderMap = new Map(existing.map(el => [el.id, el]));
+    // Insert modules in saved order, append any that aren't in the saved list
+    for (const id of layout.moduleOrder) {
+      const el = orderMap.get(id);
+      if (el) {
+        body.appendChild(el); // moves to end if already in DOM
+        orderMap.delete(id);
+      }
+    }
+    // Append any remaining (new modules not in saved order)
+    for (const el of orderMap.values()) {
+      body.appendChild(el);
+    }
   }
 }
 
@@ -680,45 +731,42 @@ function initTracer(canvasW, canvasH) {
   tracerPath = [];
 }
 
-function spawnFirework(cx, cy, color, count) {
-  const warmColors = ['#fbbf24', '#f59e0b', '#f97316', '#fb923c', '#f472b6', '#a78bfa'];
+function spawnRings(cx, cy) {
+  const ringColors = ['#fbbf24', '#f97316', '#f472b6', '#a78bfa', '#f59e0b'];
+  const count = 2 + Math.floor(Math.random() * 2); // 2-3 rings per burst
   for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 0.5 + Math.random() * 3;
-    const r = 1.5 + Math.random() * 2.5;
     particles.push({
-      x: cx,
-      y: cy,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
-      radius: r,
-      alpha: 0.7 + Math.random() * 0.3,
+      cx, cy,
+      radius: 2,
+      maxRadius: 30 + Math.random() * 50,
+      alpha: 0.8 + Math.random() * 0.2,
       life: 1,
-      decay: 0.008 + Math.random() * 0.015,
-      color: warmColors[Math.floor(Math.random() * warmColors.length)],
+      growth: 0.6 + Math.random() * 0.8,   // radius per frame
+      decay: 0.012 + Math.random() * 0.012, // alpha fade per frame
+      lineWidth: 1.5 + Math.random() * 2.5,
+      color: ringColors[Math.floor(Math.random() * ringColors.length)],
     });
   }
 }
 
 function updateParticles(ctx) {
   for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.x += p.vx;
-    p.y += p.vy;
-    p.vy += 0.04; // gravity
-    p.life -= p.decay;
-    p.alpha = p.life * 0.8;
+    const r = particles[i];
+    r.radius += r.growth;
+    r.life -= r.decay;
+    r.alpha = Math.max(0, r.life * 0.8);
 
-    if (p.life <= 0) {
+    if (r.life <= 0 || r.radius > r.maxRadius) {
       particles.splice(i, 1);
       continue;
     }
 
-    ctx.globalAlpha = p.alpha;
-    ctx.fillStyle = p.color;
+    ctx.globalAlpha = r.alpha;
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = r.lineWidth * r.life;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.radius * p.life, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.arc(r.cx, r.cy, r.radius, 0, Math.PI * 2);
+    ctx.stroke();
   }
   ctx.globalAlpha = 1;
 }
@@ -739,33 +787,55 @@ function drawTracerFrame(canvas, rate) {
 
   if (!tracer) return;
 
-  // Map rate to Y position: higher rate = higher Y.
-  // Full range from canvas bottom to near top.
-  // Adaptively track peak so mapping stays responsive to current burst range.
+  // Simplified bounce: activity kicks up, gravity pulls down. Just for fun.
   const rateClamped = Math.max(rate, 0);
-  if (!tracer._peakRate || rateClamped > tracer._peakRate) {
-    tracer._peakRate = rateClamped;
-  }
-  tracer._peakRate *= 0.999; // very slow decay (loses half in ~700 frames / ~12s)
-  const maxVis = Math.max(80, tracer._peakRate);
-  const ratio = Math.min(1, rateClamped / maxVis);
-  const topY = h * 0.04;
   const bottomY = h * 0.65;
-  const targetY = bottomY + (topY - bottomY) * ratio;
+  const bouncePeakY = h * 0.20;
 
-  // Idle animation: multi-frequency wave blended across the full range
-  // Always present, just gets smaller when ratio is high (active burst)
-  const now = performance.now();
-  const idleStrength = Math.max(0, 1 - ratio * 3); // fade out when ratio > ~0.33
-  const idleBob = idleStrength * (Math.sin(now / 1200) * 5 + Math.cos(now / 700) * 3 + Math.sin(now / 2300) * 2);
-
+  // Record Y before any movement (for trail)
   const prevY = tracer.y;
-  const finalTarget = targetY + idleBob;
-  const followAlpha = finalTarget > tracer.y ? 0.18 : 0.35; // rise smooth, fall fast
-  tracer.y += (finalTarget - tracer.y) * followAlpha;
 
-  // Ball stays at fixed X; shift trail left by speed based on rate
-  const scrollSpeed = 1.2 + ratio * 4;
+  // Init state
+  tracer._vy = tracer._vy ?? 0;
+  tracer._activity = tracer._activity ?? 0;
+
+  // Smooth activity
+  tracer._activity += (rateClamped - tracer._activity) * 0.3;
+
+  // Active when > 10 t/s
+  const active = tracer._activity > 10;
+
+  // When active and near the ground, kick up with fixed velocity
+  // so it always reaches the same peak height regardless of rate.
+  if (active && tracer.y >= bottomY - 3) {
+    tracer._vy = -(bottomY - bouncePeakY) * 0.10;
+  }
+
+  // Gravity: weaker when active (floats longer), normal when idle
+  const g = active ? 0.18 : 0.38;
+  tracer._vy += g;
+  tracer.y += tracer._vy;
+
+  // Ground
+  if (tracer.y >= bottomY) {
+    tracer.y = bottomY;
+    tracer._vy *= -0.1;
+    if (Math.abs(tracer._vy) < 0.5) tracer._vy = 0;
+  }
+
+  // Ceiling — never above peak
+  if (tracer.y < bouncePeakY) {
+    tracer.y = bouncePeakY;
+    tracer._vy = 0;
+  }
+
+  // Idle bob
+  if (tracer._vy === 0 && !active) {
+    tracer.y += Math.sin(performance.now() / 1200) * 0.8;
+  }
+
+  // Scroll speed: faster when active
+  const scrollSpeed = 1 + (active ? Math.min(tracer._activity / 100, 3) : 0);
 
   // Shift all existing points left
   for (let i = 0; i < tracerPath.length; i++) {
@@ -798,10 +868,11 @@ function drawTracerFrame(canvas, rate) {
   }
   ctx.shadowBlur = 0;
 
-  // Draw the ball at the head — size and glow scale with rate
-  const headAlpha = Math.min(1, 0.4 + ratio * 0.6);
-  const ballRadius = 2.5 + ratio * 4;
-  const glowBlur = 8 + ratio * 20;
+  // Draw the ball at the head — size and glow scale with activity
+  const intensity = Math.min(1, tracer._activity / 500);
+  const headAlpha = 0.4 + intensity * 0.6;
+  const ballRadius = 2.5 + intensity * 4;
+  const glowBlur = 8 + intensity * 20;
   ctx.shadowColor = theme.accent;
   ctx.shadowBlur = glowBlur;
   ctx.fillStyle = tg(headAlpha);
@@ -887,7 +958,7 @@ function renderBouncingBalls(data) {
     const lastFire = tracer._lastToolFire || 0;
     if (hasToolActivity && now - lastFire > 800) {
       tracer._lastToolFire = now;
-      spawnFirework(tracer.x, tracer.y, theme.accent, 18);
+      spawnRings(tracer.x, tracer.y);
     }
   }
 
@@ -923,7 +994,7 @@ function renderCandlesticks(data) {
 
   ctx.clearRect(0, 0, w, h);
 
-  const candles = data.candleHistory || [];
+  const candles = (data.candleHistory || []).slice(-20);
   if (candles.length === 0) {
     ctx.fillStyle = theme.textMuted;
     ctx.font = '9px "JetBrains Mono", monospace';
@@ -932,24 +1003,27 @@ function renderCandlesticks(data) {
     return;
   }
 
-  // Find local min/max across recent candles for better visibility
-  const windowSize = Math.min(10, candles.length);
-  let globalLow = Infinity;
-  let globalHigh = -Infinity;
-  for (let i = candles.length - windowSize; i < candles.length; i++) {
-    const c = candles[i];
-    if (c.low < globalLow) globalLow = c.low;
-    if (c.high > globalHigh) globalHigh = c.high;
+  // Y-axis based on candle body (open/close) range, ignoring wick extremes
+  // This prevents spike compression — long wicks won't flatten the view
+  let bodyLow = Infinity;
+  let bodyHigh = -Infinity;
+  for (const c of candles) {
+    const bMin = Math.min(c.open, c.close);
+    const bMax = Math.max(c.open, c.close);
+    if (bMin < bodyLow) bodyLow = bMin;
+    if (bMax > bodyHigh) bodyHigh = bMax;
   }
-  const range = globalHigh - globalLow || 1;
-  const paddedLow = globalLow - range * 0.1;
-  const paddedHigh = globalHigh + range * 0.1;
+  const range = bodyHigh - bodyLow || 1;
+  const paddedLow = bodyLow - range * 0.15;
+  const paddedHigh = bodyHigh + range * 0.15;
   const paddedRange = paddedHigh - paddedLow || 1;
 
-  const candleW = Math.max(2, (drawW / candles.length) * 0.6);
-  const gap = (drawW / candles.length) * 0.4;
+  const count = candles.length;
 
-  for (let i = 0; i < candles.length; i++) {
+  const candleW = Math.max(2, (drawW / count) * 0.6);
+  const gap = (drawW / count) * 0.4;
+
+  for (let i = 0; i < count; i++) {
     const c = candles[i];
     const x = pad.left + i * (candleW + gap) + gap / 2;
     const centerX = x + candleW / 2;
@@ -959,8 +1033,10 @@ function renderCandlesticks(data) {
     const yOpen = pad.top + drawH - ((c.open - paddedLow) / paddedRange) * drawH;
     const yClose = pad.top + drawH - ((c.close - paddedLow) / paddedRange) * drawH;
 
-    const isGreen = c.close >= c.open;
-    const color = isGreen ? theme.accent : theme.danger;
+    const isUp = c.close >= c.open;
+    const color = isUp
+      ? (isChineseLocale ? theme.danger : theme.accent)
+      : (isChineseLocale ? theme.accent : theme.danger);
 
     // Draw wick
     ctx.strokeStyle = color;
@@ -984,12 +1060,12 @@ function renderCandlesticks(data) {
 
     // Buy/Sell signal marker
     if (c.signal === 'buy') {
-      ctx.fillStyle = theme.accent;
+      ctx.fillStyle = isChineseLocale ? theme.danger : theme.accent;
       ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('▲', centerX, yLow + 10);
     } else if (c.signal === 'sell') {
-      ctx.fillStyle = theme.danger;
+      ctx.fillStyle = isChineseLocale ? theme.accent : theme.danger;
       ctx.font = 'bold 10px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('▼', centerX, yHigh - 4);
@@ -1007,11 +1083,13 @@ function renderCandlesticks(data) {
   ctx.setLineDash([]);
 
   const last = candles[candles.length - 1];
-  const latestColor = last.close >= last.open ? theme.accent : theme.danger;
+  const latestColor = last.close >= last.open
+    ? (isChineseLocale ? theme.danger : theme.accent)
+    : (isChineseLocale ? theme.accent : theme.danger);
   const burstLabel = $('burstLabel');
   if (burstLabel) {
     burstLabel.style.display = '';
-    burstLabel.innerHTML = `${t('candlestick.o')}:${last.open} ${t('candlestick.h')}:${last.high} ${t('candlestick.l')}:${last.low} ${t('candlestick.c')}:<span style="color:${latestColor};font-weight:600;">${last.close}</span>`;
+    burstLabel.innerHTML = `${t('candlestick.o')}:${+last.open.toFixed(1)} ${t('candlestick.h')}:${+last.high.toFixed(1)} ${t('candlestick.l')}:${+last.low.toFixed(1)} ${t('candlestick.c')}:<span style="color:${latestColor};font-weight:600;">${+last.close.toFixed(1)}</span>`;
   }
 }
 

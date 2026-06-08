@@ -12,7 +12,7 @@ Real-time visibility into token usage, context window, agent status, and history
 
 - **Token Flow** — Matrix rain / candlestick / tracer-ball visualization of real-time token rate
 - **Context Window** — At-a-glance progress bar showing current vs limit
-- **Section** — IN/OUT token breakdown with proportional bar
+- **Token Usage** — IN/OUT token breakdown with proportional bar
 - **Agent Status** — Multi-agent tree with tasks, progress, and token counts
 - **History Chart** — Token usage over 24h or 7d
 - **Plan Mode Badge** — Shows when Claude is in Plan Mode
@@ -78,6 +78,10 @@ claude-hud/
 ├── media/icon.svg            # Extension icon
 └── package.json
 ```
+
+## Acknowledgements
+
+This project references and adapts processing logic from [jarrodwatts/claude-hud](https://github.com/jarrodwatts/claude-hud). Thanks to the original author for the inspiration.
 
 ## License
 

@@ -1,5 +1,6 @@
 .gitignore
 .gitattributes
+.git/**
 .vscode/**
 **/*.ts
 **/*.map
@@ -7,4 +8,6 @@ tsconfig.json
 node_modules/**
 .agents/**
 .claude/**
+.codegraph/**
 skills-lock.json
+CLAUDE.md

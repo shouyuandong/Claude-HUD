@@ -4,16 +4,25 @@
   "description": "Real-time token usage, context length, and task progress HUD for Claude Code",
   "version": "0.1.0",
   "icon": "media/icon.png",
-  "publisher": "claude-hud",
+  "publisher": "shouyuan.dong",
   "repository": {
     "type": "git",
-    "url": "https://gitee-shouyuan/jalen-7/claude-hud.git"
+    "url": "https://github.com/shouyuandong/Claude-HUD"
   },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Visualization",
+    "Programming Languages",
     "Other"
+  ],
+  "keywords": [
+    "claude",
+    "token",
+    "hud",
+    "monitoring",
+    "ai"
   ],
   "activationEvents": [
     "onView:claudeHud.panel"

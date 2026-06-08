@@ -5,3 +5,4 @@ out/
 .vscode/
 *.vsix
 skills-lock.json
+.codegraph/
